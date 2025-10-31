@@ -61,16 +61,7 @@ internal class RabbitMQConnection : IAsyncDisposable
 
         try
         {
-            var channel = await _connection!.CreateChannelAsync();
-
-            // 监听通道关闭事件
-            channel.ChannelShutdownAsync += (sender, e) =>
-            {
-                _logger.LogWarning("Channel shutdown: {ShutdownInitiator}, {ShutdownReason}", e.Initiator, e.ReplyText);
-                return Task.CompletedTask;
-            };
-
-            return channel;
+            return await _connection!.CreateChannelAsync();
         }
         catch (Exception ex)
         {
