@@ -92,11 +92,7 @@ internal class RabbitMQConnection : IAsyncDisposable
         await _connectionSemaphore.WaitAsync(_cancellationTokenSource.Token);
         try
         {
-            if (_connection != null)
-            {
-                await _connection.DisposeAsync();
-                _connection = null;
-            }
+            await ClearConnectionAsync();
 
             await CreateConnectionInternalAsync();
         }
@@ -122,17 +118,32 @@ internal class RabbitMQConnection : IAsyncDisposable
             }
             if (_connection != null)
             {
-                await _connection.DisposeAsync();
-                _connection = null;
+                await ClearConnectionAsync();
             }
             _connectionSemaphore.Dispose();
             _cancellationTokenSource.Dispose();
-        }
 
-        _disposed = true;
+            _disposed = true;
+        }
     }
 
     #region Private Method
+
+    private async Task ClearConnectionAsync()
+    {
+        if (_connection != null)
+        {
+            _connection.ConnectionShutdownAsync -= ConnectionShutdownAsync;
+            _connection.CallbackExceptionAsync -= CallbackExceptionAsync;
+            _connection.ConnectionBlockedAsync -= ConnectionBlockedAsync;
+            _connection.ConnectionUnblockedAsync -= ConnectionUnblockedAsync;
+
+            await _connection.DisposeAsync();
+            _connection = null;
+
+            _logger.LogInformation("Cleared RabbitMQ connection");
+        }
+    }
 
     private async Task<bool> EnsureConnectionAsync()
     {
@@ -157,16 +168,7 @@ internal class RabbitMQConnection : IAsyncDisposable
         try
         {
             // 清理旧连接
-            if (_connection != null)
-            {
-                _connection.ConnectionShutdownAsync -= ConnectionShutdownAsync;
-                _connection.CallbackExceptionAsync -= CallbackExceptionAsync;
-                _connection.ConnectionBlockedAsync -= ConnectionBlockedAsync;
-                _connection.ConnectionUnblockedAsync -= ConnectionUnblockedAsync;
-
-                await _connection.DisposeAsync();
-                _connection = null;
-            }
+            await ClearConnectionAsync();
 
             // 尝试重连
             if (_reconnectAttempts < _maxReconnectAttempts)
@@ -246,18 +248,22 @@ internal class RabbitMQConnection : IAsyncDisposable
         await HandleConnectionFailureAsync();
     }
 
-    private async Task ConnectionBlockedAsync(object sender, ConnectionBlockedEventArgs e)
+    private Task ConnectionBlockedAsync(object sender, ConnectionBlockedEventArgs e)
     {
-        if (_disposed) return;
-
-        _logger.LogWarning("RabbitMQ connection blocked: {Reason}", e.Reason);
+        if (!_disposed)
+        {
+            _logger.LogWarning("RabbitMQ connection blocked: {Reason}", e.Reason);
+        }
+        return Task.CompletedTask;
     }
 
-    private async Task ConnectionUnblockedAsync(object sender, AsyncEventArgs e)
+    private Task ConnectionUnblockedAsync(object sender, AsyncEventArgs e)
     {
-        if (_disposed) return;
-
-        _logger.LogInformation("RabbitMQ connection unblocked");
+        if (!_disposed)
+        {
+            _logger.LogInformation("RabbitMQ connection unblocked");
+        }
+        return Task.CompletedTask;
     }
 
     #endregion

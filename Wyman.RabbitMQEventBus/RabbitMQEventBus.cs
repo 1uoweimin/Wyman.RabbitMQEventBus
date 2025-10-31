@@ -18,14 +18,14 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     private readonly IntegrationEventSubscriptionsManager _subscriptionsManager;
     private readonly ILogger<RabbitMQEventBus> _logger;
     private readonly RabbitMqOption _options;
-    private readonly SemaphoreSlim _publishSemaphore = new(1, 1);
     private readonly SemaphoreSlim _consumerSemaphore = new(1, 1);
     private readonly CancellationTokenSource _cancellationTokenSource = new();
-    private IChannel? _publisherChannel;
     private IChannel? _consumerChannel;
     private readonly string _queueName;
     private bool _isStartBasicConsumer = false;
     private bool _disposed = false;
+
+    private bool _isOpenConsumerChannel => _consumerChannel != null && !_consumerChannel.IsClosed;
 
     public RabbitMQEventBus(IServiceScopeFactory serviceScopeFactory, IConnectionFactory connectionFactory, string queueName, ILoggerFactory loggerFactory, RabbitMqOption options)
     {
@@ -42,12 +42,12 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task PublishAsync(string eventName, object? eventData)
     {
         ThrowIfDisposed();
-
-        if (string.IsNullOrWhiteSpace(eventName)) throw new ArgumentException("Event name cannot be null or empty.", nameof(eventName));
+        ThrowIfNull(eventName);
 
         try
         {
-            var channel = await EnsurePublisherChannelAsync();
+            using var channel = await CreateChannelAsync();
+            await channel.ExchangeDeclareAsync(_options.ExchangeName, "direct", true, false);
 
             var body = eventData == null
                 ? []
@@ -69,19 +69,17 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task SubscribeAsync(string eventName, Type handlerType)
     {
         ThrowIfDisposed();
-
-        if (string.IsNullOrWhiteSpace(eventName)) throw new ArgumentException("Event name cannot be null or empty.", nameof(eventName));
-
+        ThrowIfNull(eventName);
         CheckHandlerType(handlerType);
 
         await _consumerSemaphore.WaitAsync(_cancellationTokenSource.Token);
         try
         {
-            var channel = await EnsureConsumerChannelAsync();
+            await EnsureConsumerChannelAsync();
 
             if (!_subscriptionsManager.HasSubscriptionsForEvent(eventName))
             {
-                await channel.QueueBindAsync(_queueName, _options.ExchangeName, eventName);
+                await _consumerChannel!.QueueBindAsync(_queueName, _options.ExchangeName, eventName);
                 _logger.LogInformation("Queue '{QueueName}' bound to exchange '{ExchangeName}' with routing key '{EventName}'", _queueName, _options.ExchangeName, eventName);
             }
 
@@ -90,7 +88,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
 
             if (!_isStartBasicConsumer)
             {
-                await StartBasicConsumerAsync(channel);
+                await StartBasicConsumerAsync();
             }
         }
         catch (Exception ex)
@@ -107,9 +105,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task UnsubscribeAsync(string eventName, Type handlerType)
     {
         ThrowIfDisposed();
-
-        if (string.IsNullOrWhiteSpace(eventName)) throw new ArgumentException("Event name cannot be null or empty.", nameof(eventName));
-
+        ThrowIfNull(eventName);
         CheckHandlerType(handlerType);
 
         await _consumerSemaphore.WaitAsync(_cancellationTokenSource.Token);
@@ -120,8 +116,8 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
 
             if (!_subscriptionsManager.HasSubscriptionsForEvent(eventName))
             {
-                var channel = await EnsureConsumerChannelAsync();
-                await channel.QueueUnbindAsync(_queueName, _options.ExchangeName, eventName);
+                await EnsureConsumerChannelAsync();
+                await _consumerChannel!.QueueUnbindAsync(_queueName, _options.ExchangeName, eventName);
                 _logger.LogInformation("Queue '{QueueName}' unbound from exchange '{ExchangeName}' with routing key '{EventName}'", _queueName, _options.ExchangeName, eventName);
 
                 if (_subscriptionsManager.IsEmpty)
@@ -151,27 +147,28 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
         }
         finally
         {
-            _publisherChannel?.Dispose();
             _consumerChannel?.Dispose();
             await _connection.DisposeAsync();
             _subscriptionsManager.Dispose();
             _cancellationTokenSource.Dispose();
-            _publishSemaphore.Dispose();
             _consumerSemaphore.Dispose();
-        }
 
-        _disposed = true;
+            _disposed = true;
+        }
     }
 
     #region Private Methode
 
     private void ValidateOptions()
     {
-        if (string.IsNullOrWhiteSpace(_options.HostName)) throw new ArgumentException("HostName cannot be null or empty.", nameof(_options.HostName));
-
-        if (string.IsNullOrWhiteSpace(_options.ExchangeName)) throw new ArgumentException("ExchangeName cannot be null or empty.", nameof(_options.ExchangeName));
-
+        ThrowIfNull(_options.HostName);
+        ThrowIfNull(_options.ExchangeName);
         if (_options.PrefetchCount <= 0) throw new ArgumentException("PrefetchCount must be greater than 0.", nameof(_options.PrefetchCount));
+    }
+
+    private void ThrowIfNull(string argumentName)
+    {
+        if (string.IsNullOrWhiteSpace(argumentName)) throw new ArgumentNullException("Argument cannot be null or empty.", nameof(argumentName));
     }
 
     private void ThrowIfDisposed()
@@ -186,62 +183,6 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
         if (!typeof(IIntegrationEventHandler).IsAssignableFrom(handlerType)) throw new ArgumentException($"Handler type '{handlerType.FullName}' must implement '{nameof(IIntegrationEventHandler)}'.", nameof(handlerType));
     }
 
-    private async Task<IChannel> EnsurePublisherChannelAsync()
-    {
-        if (IsPublisherChannel()) return _publisherChannel!;
-
-        await _publishSemaphore.WaitAsync(_cancellationTokenSource.Token);
-        try
-        {
-            if (IsPublisherChannel()) return _publisherChannel!;
-
-            _publisherChannel = await CreateChannelAsync();
-            await _publisherChannel.ExchangeDeclareAsync(_options.ExchangeName, "direct", true, false);
-            return _publisherChannel;
-        }
-        finally
-        {
-            _publishSemaphore.Release();
-        }
-
-        bool IsPublisherChannel() => _publisherChannel != null && !_publisherChannel.IsClosed;
-    }
-
-    private async Task<IChannel> EnsureConsumerChannelAsync()
-    {
-        if (IsConsumerChannel()) return _consumerChannel!;
-
-        await _publishSemaphore.WaitAsync(_cancellationTokenSource.Token);
-        try
-        {
-            if (IsConsumerChannel()) return _consumerChannel!;
-
-            _consumerChannel = await CreateChannelAsync();
-            await _consumerChannel.ExchangeDeclareAsync(_options.ExchangeName, "direct", true, false);
-            await _consumerChannel.QueueDeclareAsync(_queueName, _options.QueueDurable, false, false, null);
-
-            _consumerChannel.CallbackExceptionAsync += (sender, @event) =>
-            {
-                _logger.LogError(@event.Exception, "Channel callback exception occurred");
-                return Task.CompletedTask;
-            };
-
-            _consumerChannel.ChannelShutdownAsync += (sender, @event) =>
-            {
-                _logger.LogWarning("Consumer channel shutdown: {ShutdownInitiator}, {ShutdownReason}", @event.Initiator, @event.ReplyText);
-                return Task.CompletedTask;
-            };
-
-            return _consumerChannel;
-        }
-        finally
-        {
-            _publishSemaphore.Release();
-        }
-
-        bool IsConsumerChannel() => _consumerChannel != null && !_consumerChannel.IsClosed;
-    }
-
     private async Task<IChannel> CreateChannelAsync()
     {
         if (!_connection.IsConnected) await _connection.TryConnectionAsync();
@@ -250,14 +191,28 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
         return channel;
     }
 
-    private async Task StartBasicConsumerAsync(IChannel channel)
+    private async Task EnsureConsumerChannelAsync()
+    {
+        if (_isOpenConsumerChannel) return;
+
+        if (_isOpenConsumerChannel) return;
+
+        _consumerChannel = await CreateChannelAsync();
+        await _consumerChannel.ExchangeDeclareAsync(_options.ExchangeName, "direct", true, false);
+        await _consumerChannel.QueueDeclareAsync(_queueName, _options.QueueDurable, false, false, null);
+
+        _consumerChannel.CallbackExceptionAsync += Consumer_CallbackExceptionAsync;
+        _consumerChannel.ChannelShutdownAsync += Consumer_ChannelShutdownAsync;
+    }
+
+    private async Task StartBasicConsumerAsync()
     {
         try
         {
-            await channel.BasicQosAsync(0, _options.PrefetchCount, false);
-            var consumer = new AsyncEventingBasicConsumer(channel);
+            await _consumerChannel!.BasicQosAsync(0, _options.PrefetchCount, false);
+            var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
             consumer.ReceivedAsync += Consumer_ReceivedAsync;
-            await channel.BasicConsumeAsync(_queueName, false, consumer);
+            await _consumerChannel.BasicConsumeAsync(_queueName, false, consumer);
             _isStartBasicConsumer = true;
             _logger.LogInformation("Basic consumer started for queue '{QueueName}'", _queueName);
         }
@@ -268,17 +223,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
         }
     }
 
-    private async Task StopBasicConsumerAsync()
-    {
-        if (_consumerChannel == null || !_isStartBasicConsumer) return;
-
-        await _consumerChannel.CloseAsync();
-        _consumerChannel = null;
-        _isStartBasicConsumer = false;
-        _logger.LogInformation("Basic consumer stopped for queue '{QueueName}'", _queueName);
-    }
-
-    private async Task Consumer_ReceivedAsync(object? sender, BasicDeliverEventArgs eventArgs)
+    private async Task Consumer_ReceivedAsync(object sender, BasicDeliverEventArgs eventArgs)
     {
         var eventName = eventArgs.RoutingKey;
         var eventData = Encoding.UTF8.GetString(eventArgs.Body.Span);
@@ -289,26 +234,26 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
         {
             await HandleEventAsync(eventName, eventData);
 
-            if (_consumerChannel != null && !_consumerChannel.IsClosed)
+            if (_isOpenConsumerChannel)
             {
-                await _consumerChannel.BasicAckAsync(eventArgs.DeliveryTag, false);
+                await _consumerChannel!.BasicAckAsync(eventArgs.DeliveryTag, false);
                 _logger.LogDebug($"Event '{eventName}' processed successfully, acknowledged");
             }
         }
         catch (OperationCanceledException)
         {
             _logger.LogWarning($"Event '{eventName}' processing timed out");
-            if (_consumerChannel != null && !_consumerChannel.IsClosed)
+            if (_isOpenConsumerChannel)
             {
-                await _consumerChannel.BasicNackAsync(eventArgs.DeliveryTag, false, _options.RequeueOnFailure);
+                await _consumerChannel!.BasicNackAsync(eventArgs.DeliveryTag, false, _options.RequeueOnFailure);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, $"Error handling event '{eventName}' with delivery tag {eventArgs.DeliveryTag}");
-            if (_consumerChannel != null && !_consumerChannel.IsClosed)
+            if (_isOpenConsumerChannel)
             {
-                await _consumerChannel.BasicNackAsync(eventArgs.DeliveryTag, false, _options.RequeueOnFailure);
+                await _consumerChannel!.BasicNackAsync(eventArgs.DeliveryTag, false, _options.RequeueOnFailure);
             }
         }
     }
@@ -352,6 +297,31 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
             _logger.LogError(ex, $"Handler '{handler.Name}' failed to process event '{eventName}'");
             throw;
         }
+    }
+
+    private async Task StopBasicConsumerAsync()
+    {
+        if (_consumerChannel == null) return;
+
+        _consumerChannel.CallbackExceptionAsync -= Consumer_CallbackExceptionAsync;
+        _consumerChannel.ChannelShutdownAsync -= Consumer_ChannelShutdownAsync;
+
+        await _consumerChannel.CloseAsync();
+        _consumerChannel = null;
+
+        _logger.LogInformation("Basic consumer stopped for queue '{QueueName}'", _queueName);
+    }
+
+    private Task Consumer_CallbackExceptionAsync(object sender, CallbackExceptionEventArgs @event)
+    {
+        _logger.LogError(@event.Exception, "Channel callback exception occurred");
+        return Task.CompletedTask;
+    }
+
+    private Task Consumer_ChannelShutdownAsync(object sender, ShutdownEventArgs @event)
+    {
+        _logger.LogWarning("Consumer channel shutdown: {ShutdownInitiator}, {ShutdownReason}", @event.Initiator, @event.ReplyText);
+        return Task.CompletedTask;
     }
 
     #endregion
