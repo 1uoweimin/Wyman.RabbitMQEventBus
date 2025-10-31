@@ -19,8 +19,6 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.UseRabbitMQEventBus();
-
 app.UseAuthorization();
 
 app.MapControllers();

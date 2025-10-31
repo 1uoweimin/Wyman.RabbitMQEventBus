@@ -48,6 +48,9 @@ public static class RabbitMQExtensions
             services.AddScoped(handlerType);
         }
 
+        // 保存处理器类型注册表，供后台服务启动时订阅使用
+        services.AddSingleton(new IntegrationEventHandlerRegistry(eventHandlerTypes.ToArray()));
+
         services.AddSingleton<IEventBus>(sp =>
         {
             var serviceScopeFactory = sp.GetRequiredService<IServiceScopeFactory>();
@@ -62,39 +65,11 @@ public static class RabbitMQExtensions
 
             if (string.IsNullOrWhiteSpace(queueName)) throw new ArgumentNullException(nameof(queueName));
 
-            var rabbitMQEventBus = new RabbitMQEventBus(serviceScopeFactory, connectionFactory, queueName, loggerFactory, rabbitMqOption);
-
-            foreach (var eventHandlerType in eventHandlerTypes)
-            {
-                var integrationEventNameAttributes = eventHandlerType.GetCustomAttributes<IntegrationEventNameAttribute>();
-                if (!integrationEventNameAttributes.Any())
-                {
-                    throw new InvalidOperationException($"There shoule be at least one IntegrationEventNameAttribute on {eventHandlerType}");
-                }
-                foreach (var attribute in integrationEventNameAttributes)
-                {
-                    rabbitMQEventBus.SubscribeAsync(attribute.Name, eventHandlerType).GetAwaiter().GetResult();
-                }
-            }
-
-            return rabbitMQEventBus;
+            return new RabbitMQEventBus(serviceScopeFactory, connectionFactory, queueName, loggerFactory, rabbitMqOption);
         });
-        return services;
-    }
 
-    /// <summary>
-    /// 使用RabbitMQ事件总线中间件。
-    /// </summary>
-    /// <param name="app"></param>
-    /// <returns></returns>
-    /// <exception cref="InvalidOperationException"></exception>
-    public static IApplicationBuilder UseRabbitMQEventBus(this IApplicationBuilder app)
-    {
-        var eventBus = app.ApplicationServices.GetService<IEventBus>();
-        if (eventBus == null)
-        {
-            throw new InvalidOperationException("IEventBus is not registered. Please call AddRabbitMQEventBus before UseRabbitMQEventBus.");
-        }
-        return app;
+        // 使用后台托管服务在应用启动后执行事件订阅，避免阻塞构建期
+        services.AddHostedService<EventBusInitializerHostedService>();
+        return services;
     }
 }

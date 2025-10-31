@@ -42,7 +42,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task PublishAsync(string eventName, object? eventData)
     {
         ThrowIfDisposed();
-        ThrowIfNull(eventName);
+        ThrowIfNullOrWhiteSpace(eventName, nameof(eventName));
 
         try
         {
@@ -69,7 +69,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task SubscribeAsync(string eventName, Type handlerType)
     {
         ThrowIfDisposed();
-        ThrowIfNull(eventName);
+        ThrowIfNullOrWhiteSpace(eventName, nameof(eventName));
         CheckHandlerType(handlerType);
 
         await _consumerSemaphore.WaitAsync(_cancellationTokenSource.Token);
@@ -105,7 +105,7 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
     public async Task UnsubscribeAsync(string eventName, Type handlerType)
     {
         ThrowIfDisposed();
-        ThrowIfNull(eventName);
+        ThrowIfNullOrWhiteSpace(eventName, nameof(eventName));
         CheckHandlerType(handlerType);
 
         await _consumerSemaphore.WaitAsync(_cancellationTokenSource.Token);
@@ -161,14 +161,14 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
 
     private void ValidateOptions()
     {
-        ThrowIfNull(_options.HostName);
-        ThrowIfNull(_options.ExchangeName);
+        ThrowIfNullOrWhiteSpace(_options.HostName, nameof(_options.HostName));
+        ThrowIfNullOrWhiteSpace(_options.ExchangeName, nameof(_options.ExchangeName));
         if (_options.PrefetchCount <= 0) throw new ArgumentException("PrefetchCount must be greater than 0.", nameof(_options.PrefetchCount));
     }
 
-    private void ThrowIfNull(string argumentName)
+    private void ThrowIfNullOrWhiteSpace(string? value, string paramName)
     {
-        if (string.IsNullOrWhiteSpace(argumentName)) throw new ArgumentNullException("Argument cannot be null or empty.", nameof(argumentName));
+        if (string.IsNullOrWhiteSpace(value)) throw new ArgumentNullException(paramName, "Argument cannot be null or empty.");
     }
 
     private void ThrowIfDisposed()
@@ -193,8 +193,6 @@ internal class RabbitMQEventBus : IEventBus, IAsyncDisposable
 
     private async Task EnsureConsumerChannelAsync()
     {
-        if (_isOpenConsumerChannel) return;
-
         if (_isOpenConsumerChannel) return;
 
         _consumerChannel = await CreateChannelAsync();
